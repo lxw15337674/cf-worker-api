@@ -1,0 +1,24 @@
+{
+  "name": "cf-workers-api",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "test": "vitest run",
+    "init-database": "npx tsx scripts/init-notion-database.ts"
+  },
+  "dependencies": {
+    "@hono/standard-validator": "^0.2.2",
+    "@scalar/hono-api-reference": "^0.9.37",
+    "hono": "^4.11.7",
+    "hono-openapi": "^1.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.7",
+    "@cloudflare/workers-types": "^4.20260128.0",
+    "@vitest/runner": "~3.2.4",
+    "@vitest/snapshot": "~3.2.4",
+    "vitest": "~3.2.4",
+    "wrangler": "^4.61.0"
+  }
+}

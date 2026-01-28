@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rg:*)",
+      "Bash(npm run build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(rm:*)",
+      "Bash(del:*)",
+      "Bash(powershell:*)",
+      "Bash(npm run dev:*)",
+      "WebFetch(domain:hono.dev)",
+      "WebSearch",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm run dev)",
+      "Bash(curl:*)",
+      "Bash(pnpm run build)",
+      "Bash(cat:*)",
+      "Bash(wc:*)",
+      "Bash(python -c:*)",
+      "Bash(npx tsx:*)",
+      "Bash(pnpm test:*)",
+      "WebFetch(domain:developers.notion.com)"
+    ],
+    "deny": []
+  }
+}
