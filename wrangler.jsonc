@@ -1,8 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "main": "src/index.ts",
+  "compatibility_date": "2026-01-24",
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
+    "remote": true
   },
   "observability": {
     "enabled": true,

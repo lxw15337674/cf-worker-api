@@ -1,9 +1,26 @@
-import { Hono } from 'hono'
 import { Scalar } from '@scalar/hono-api-reference'
-import { aiRoutes } from './routes/ai'
+import { OpenAPIHono } from '@hono/zod-openapi'
+import { aiRunHandler, aiRunRoute } from './routes/ai'
 import type { Bindings } from './types/hono-env'
+import { AiRunError, toErrorBody } from './utils/ai-errors'
+import { getTraceId } from './utils/trace'
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new OpenAPIHono<{ Bindings: Bindings }>({
+  defaultHook: (result, c) => {
+    if (result.success) {
+      return
+    }
+    const traceId = getTraceId(c)
+    const err = new AiRunError({
+      code: 'INVALID_INPUT',
+      message: 'Request validation failed',
+      status: 400,
+      traceId,
+      cause: result.error,
+    })
+    return c.json(toErrorBody(err), err.status)
+  },
+})
 
 // OpenAPI 配置
 const openApiConfig = {
@@ -31,18 +48,12 @@ app.get('/', (c) => {
 app.get('/docs',
   Scalar({
     theme: 'purple',
+    url: '/openapi.json',
   })
 )
 
-// OpenAPI JSON 端点 - 模板规范（空路径）
-app.get('/openapi.json', (c) => {
-  const fullSpec = {
-    ...openApiConfig,
-    paths: {}
-  }
-  return c.json(fullSpec)
-})
+app.doc('/openapi.json', openApiConfig)
 
-app.route('/ai', aiRoutes)
+app.openapi(aiRunRoute, aiRunHandler)
 
 export default app
