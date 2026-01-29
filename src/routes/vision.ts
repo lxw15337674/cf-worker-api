@@ -7,9 +7,8 @@ import { getTraceId } from '../utils/trace'
 import { decode as decodeAvif } from '@jsquash/avif'
 import { encode as encodePng } from '@jsquash/png'
 
-const DEFAULT_DETR_MODEL = '@cf/facebook/detr-resnet-50'
-const DEFAULT_THRESHOLD = 0.7
-const DEFAULT_MIN_AREA_RATIO = 0.2
+const DEFAULT_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct'
+const PERSON_AREA_RATIO = 0.3
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 15_000
 
@@ -20,26 +19,6 @@ const PersonDetectRequestSchema = z.object({
     .string()
     .url()
     .openapi({ description: 'Public image URL to fetch and analyze.' }),
-  threshold: z
-    .number()
-    .min(0)
-    .max(1)
-    .optional()
-    .openapi({ description: 'Confidence threshold for person detection.' }),
-  minAreaRatio: z
-    .number()
-    .min(0)
-    .max(1)
-    .optional()
-    .openapi({
-      description: 'Minimum person box area ratio (0-1). Default is 0.2.',
-    }),
-  model: z
-    .string()
-    .optional()
-    .openapi({
-      description: 'Optional model override. Default is @cf/facebook/detr-resnet-50.',
-    }),
 })
 
 const PersonDetectUploadSchema = z.object({
@@ -48,22 +27,6 @@ const PersonDetectUploadSchema = z.object({
     format: 'binary',
     description: 'Image file to upload and analyze.',
   }),
-  threshold: z
-    .union([z.string(), z.number()])
-    .optional()
-    .openapi({ description: 'Confidence threshold for person detection.' }),
-  minAreaRatio: z
-    .union([z.string(), z.number()])
-    .optional()
-    .openapi({
-      description: 'Minimum person box area ratio (0-1). Default is 0.2.',
-    }),
-  model: z
-    .string()
-    .optional()
-    .openapi({
-      description: 'Optional model override. Default is @cf/facebook/detr-resnet-50.',
-    }),
 })
 
 const PersonDetectResponseSchema = z.object({
@@ -94,6 +57,9 @@ export const personDetectRoute = createRoute({
   method: 'post',
   path: '/ai/vision/person-detect',
   tags: ['AI', 'Vision'],
+  summary: 'Detect person (Llama 4 Scout)',
+  description:
+    'Returns isPerson=true only when a person occupies at least 30% of the image area.',
   request: {
     body: {
       required: true,
@@ -108,18 +74,9 @@ export const personDetectRoute = createRoute({
               },
             },
             custom_threshold: {
-              summary: 'Custom threshold',
+              summary: 'Alternate sample image',
               value: {
                 url: 'https://gallery233.pages.dev/file/CAACAgUAAyEGAASTYPw6AAEErwppelx1gAZ3GYjD_GgMNvp5dcFoCQACiBcAAivo2FdGPB0AAVbLGgw4BA.webp',
-                threshold: 0.6,
-                minAreaRatio: 0.2,
-              },
-            },
-            area_ratio_only: {
-              summary: 'Minimum person box area ratio',
-              value: {
-                url: 'https://gallery233.pages.dev/file/CAACAgUAAyEGAASTYPw6AAEErwppelx1gAZ3GYjD_GgMNvp5dcFoCQACiBcAAivo2FdGPB0AAVbLGgw4BA.webp',
-                minAreaRatio: 0.2,
               },
             },
           },
@@ -131,8 +88,6 @@ export const personDetectRoute = createRoute({
               summary: 'Upload image file',
               value: {
                 file: '<binary>',
-                threshold: '0.7',
-                minAreaRatio: '0.2',
               },
             },
           },
@@ -225,23 +180,14 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
         })
       }
 
-      const threshold = parseThreshold(body.threshold)
-      const minAreaRatio = parseRatio(body.minAreaRatio)
-      const model = typeof body.model === 'string' ? body.model : undefined
       const buffer = await file.arrayBuffer()
-      const imageBytes = await maybeTranscodeAvif(buffer, file.type, traceId)
-      const inputs = { image: [...imageBytes] }
-      const result = await runAiModel({
-        ai: c.env.AI,
-        model: model ?? DEFAULT_DETR_MODEL,
-        input: inputs,
+      const { bytes, contentType: finalContentType } =
+        await normalizeImageBytes(buffer, file.type, traceId)
+      const isPerson = await detectPersonWithLlama(
+        bytes,
+        finalContentType,
         traceId,
-      })
-
-      const isPerson = hasPerson(
-        result,
-        threshold ?? DEFAULT_THRESHOLD,
-        minAreaRatio ?? DEFAULT_MIN_AREA_RATIO
+        c.env.AI
       )
       return c.json({ success: true, isPerson })
     }
@@ -278,28 +224,21 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
         cause: parsed.error,
       })
     }
-    const { url, threshold, model, minAreaRatio } = parsed.data
+    const { url } = parsed.data
     const { buffer, contentType: fetchedContentType } = await fetchImageBuffer(
       url,
       traceId
     )
-    const imageBytes = await maybeTranscodeAvif(
+    const { bytes, contentType: finalContentType } = await normalizeImageBytes(
       buffer,
       fetchedContentType,
       traceId
     )
-    const inputs = { image: [...imageBytes] }
-    const result = await runAiModel({
-      ai: c.env.AI,
-      model: model ?? DEFAULT_DETR_MODEL,
-      input: inputs,
+    const isPerson = await detectPersonWithLlama(
+      bytes,
+      finalContentType,
       traceId,
-    })
-
-    const isPerson = hasPerson(
-      result,
-      threshold ?? DEFAULT_THRESHOLD,
-      minAreaRatio ?? DEFAULT_MIN_AREA_RATIO
+      c.env.AI
     )
     return c.json({ success: true, isPerson })
   } catch (error) {
@@ -382,49 +321,33 @@ function isJsonContentType(contentType: string) {
   return value.includes('application/json') || value.includes('+json')
 }
 
-function parseRatio(value: unknown) {
-  const parsed = parseThreshold(value)
-  if (typeof parsed === 'number' && parsed >= 0 && parsed <= 1) {
-    return parsed
-  }
-  return undefined
-}
-
-function parseThreshold(value: unknown) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value
-  }
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value)
-    if (Number.isFinite(parsed)) {
-      return parsed
-    }
-  }
-  return undefined
-}
-
-async function maybeTranscodeAvif(
+async function normalizeImageBytes(
   buffer: ArrayBuffer,
   contentType: string | undefined,
   traceId: string
 ) {
-  if (!isAvif(buffer, contentType)) {
-    return new Uint8Array(buffer)
+  if (isAvif(buffer, contentType)) {
+    try {
+      const imageData = await decodeAvif(new Uint8Array(buffer))
+      const pngBuffer = await encodePng(imageData)
+      return {
+        bytes: new Uint8Array(pngBuffer),
+        contentType: 'image/png',
+      }
+    } catch (error) {
+      throw new AiRunError({
+        code: 'INVALID_INPUT',
+        message: 'Failed to decode AVIF image',
+        status: 400,
+        traceId,
+        cause: error,
+      })
+    }
   }
 
-  try {
-    const imageData = await decodeAvif(new Uint8Array(buffer))
-    const pngBuffer = await encodePng(imageData)
-    return new Uint8Array(pngBuffer)
-  } catch (error) {
-    throw new AiRunError({
-      code: 'INVALID_INPUT',
-      message: 'Failed to decode AVIF image',
-      status: 400,
-      traceId,
-      cause: error,
-    })
-  }
+  const bytes = new Uint8Array(buffer)
+  const resolvedType = normalizeMimeType(contentType, bytes)
+  return { bytes, contentType: resolvedType }
 }
 
 function isAvif(buffer: ArrayBuffer, contentType?: string) {
@@ -461,92 +384,180 @@ function isAvif(buffer: ArrayBuffer, contentType?: string) {
   return false
 }
 
-function hasPerson(result: unknown, threshold: number, minAreaRatio: number) {
-  if (!Array.isArray(result)) {
-    return false
+function normalizeMimeType(contentType: string | undefined, bytes: Uint8Array) {
+  if (contentType) {
+    const normalized = contentType.split(';')[0].trim().toLowerCase()
+    if (normalized.startsWith('image/')) {
+      return normalized
+    }
   }
-  console.log('Detection result:', result)
-  debugger
-  return result.some((item) => {
-    if (!item || typeof item !== 'object') {
-      return false
-    }
-    const record = item as Record<string, unknown>
-    if (record.label !== 'person' || typeof record.score !== 'number') {
-      return false
-    }
-    if (record.score < threshold) {
-      return false
-    }
-
-    const ratio = extractAreaRatio(record)
-    if (ratio === null) {
-      return true
-    }
-    return ratio >= minAreaRatio
-  })
+  return detectMimeType(bytes) ?? 'image/png'
 }
 
-function extractAreaRatio(record: Record<string, unknown>) {
-  const box = record.box
-  if (!box || typeof box !== 'object') {
-    return null
-  }
-
-  const asRecord = box as Record<string, unknown>
-  const x1 = numberOrUndefined(
-    asRecord.xmin ?? asRecord.x1 ?? asRecord.left ?? asRecord.x0
-  )
-  const y1 = numberOrUndefined(
-    asRecord.ymin ?? asRecord.y1 ?? asRecord.top ?? asRecord.y0
-  )
-  const x2 = numberOrUndefined(
-    asRecord.xmax ?? asRecord.x2 ?? asRecord.right ?? asRecord.x1
-  )
-  const y2 = numberOrUndefined(
-    asRecord.ymax ?? asRecord.y2 ?? asRecord.bottom ?? asRecord.y1
-  )
-  if (x1 !== undefined && y1 !== undefined && x2 !== undefined && y2 !== undefined) {
-    const width = x2 - x1
-    const height = y2 - y1
-    return normalizedArea(width, height)
-  }
-
-  const width = numberOrUndefined(asRecord.w ?? asRecord.width)
-  const height = numberOrUndefined(asRecord.h ?? asRecord.height)
-  if (width !== undefined && height !== undefined) {
-    return normalizedArea(width, height)
-  }
-
-  if (Array.isArray(box) && box.length >= 4) {
-    const bx1 = numberOrUndefined(box[0])
-    const by1 = numberOrUndefined(box[1])
-    const bx2 = numberOrUndefined(box[2])
-    const by2 = numberOrUndefined(box[3])
-    if (bx1 !== undefined && by1 !== undefined && bx2 !== undefined && by2 !== undefined) {
-      return normalizedArea(bx2 - bx1, by2 - by1)
+function detectMimeType(bytes: Uint8Array) {
+  if (bytes.length >= 12) {
+    if (
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47
+    ) {
+      return 'image/png'
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+      return 'image/jpeg'
+    }
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+      return 'image/gif'
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return 'image/webp'
     }
   }
+  return undefined
+}
 
+async function detectPersonWithLlama(
+  bytes: Uint8Array,
+  contentType: string,
+  traceId: string,
+  ai: Bindings['AI']
+) {
+  const dataUri = buildDataUri(bytes, contentType)
+  const minAreaPercent = Math.round(PERSON_AREA_RATIO * 100)
+  const result = await runAiModel({
+    ai,
+    model: DEFAULT_MODEL,
+    input: {
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a vision classifier. Respond with JSON only, no extra text.',
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text:
+                `Return {"isPerson": true} only if a person occupies at least ${minAreaPercent}% of the image area. ` +
+                'If unsure, return {"isPerson": false}.',
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: dataUri,
+              },
+            },
+          ],
+        },
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          type: 'object',
+          properties: {
+            isPerson: { type: 'boolean' },
+          },
+          required: ['isPerson'],
+          additionalProperties: false,
+        },
+      },
+      temperature: 0,
+      max_tokens: 32,
+    },
+    traceId,
+  })
+
+  const parsed = extractIsPersonResult(result)
+  if (!parsed || typeof parsed.isPerson !== 'boolean') {
+    throw new AiRunError({
+      code: 'AI_RUN_RESPONSE_ERROR',
+      message: 'Model returned invalid JSON',
+      status: 502,
+      traceId,
+      raw: result,
+    })
+  }
+
+  return parsed.isPerson
+}
+
+function extractIsPersonResult(result: unknown) {
+  if (!result || typeof result !== 'object') {
+    return null
+  }
+  const record = result as Record<string, unknown>
+  const direct = normalizeIsPerson(record.response)
+  if (direct) {
+    return direct
+  }
+  if (
+    record.result &&
+    typeof record.result === 'object' &&
+    (record.result as Record<string, unknown>).response !== undefined
+  ) {
+    return normalizeIsPerson((record.result as Record<string, unknown>).response)
+  }
+  if (typeof record.response === 'string') {
+    return parseJsonFromText(record.response)
+  }
   return null
 }
 
-function normalizedArea(width: number, height: number) {
-  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+function parseJsonFromText(text: string) {
+  const trimmed = text.trim()
+  try {
+    return JSON.parse(trimmed) as { isPerson?: unknown }
+  } catch {
+    const start = trimmed.indexOf('{')
+    const end = trimmed.lastIndexOf('}')
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(trimmed.slice(start, end + 1)) as {
+          isPerson?: unknown
+        }
+      } catch {
+        return null
+      }
+    }
     return null
   }
-  if (width <= 0 || height <= 0) {
-    return null
-  }
-  if (width > 1 || height > 1) {
-    return null
-  }
-  return width * height
 }
 
-function numberOrUndefined(value: unknown) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value
+function normalizeIsPerson(value: unknown) {
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    if (typeof record.isPerson === 'boolean') {
+      return { isPerson: record.isPerson }
+    }
   }
-  return undefined
+  if (typeof value === 'string') {
+    return parseJsonFromText(value)
+  }
+  return null
+}
+
+function buildDataUri(bytes: Uint8Array, contentType: string) {
+  const base64 = toBase64(bytes)
+  return `data:${contentType};base64,${base64}`
+}
+
+function toBase64(bytes: Uint8Array) {
+  const chunkSize = 0x8000
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
 }
