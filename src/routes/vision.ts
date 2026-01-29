@@ -227,8 +227,15 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
       })
     }
     const { url, threshold, model } = parsed.data
-    const { buffer, contentType } = await fetchImageBuffer(url, traceId)
-    const imageBytes = await maybeTranscodeAvif(buffer, contentType, traceId)
+    const { buffer, contentType: fetchedContentType } = await fetchImageBuffer(
+      url,
+      traceId
+    )
+    const imageBytes = await maybeTranscodeAvif(
+      buffer,
+      fetchedContentType,
+      traceId
+    )
     const inputs = { image: [...imageBytes] }
     const result = await runAiModel({
       ai: c.env.AI,
