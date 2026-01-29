@@ -9,23 +9,61 @@ import { encode as encodePng } from '@jsquash/png'
 
 const DEFAULT_DETR_MODEL = '@cf/facebook/detr-resnet-50'
 const DEFAULT_THRESHOLD = 0.7
+const DEFAULT_MIN_AREA_RATIO = 0.2
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 15_000
 
 extendZodWithOpenApi(z)
 
 const PersonDetectRequestSchema = z.object({
-  url: z.string().url(),
-  threshold: z.number().min(0).max(1).optional(),
-  model: z.string().optional(),
+  url: z
+    .string()
+    .url()
+    .openapi({ description: 'Public image URL to fetch and analyze.' }),
+  threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .openapi({ description: 'Confidence threshold for person detection.' }),
+  minAreaRatio: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .openapi({
+      description: 'Minimum person box area ratio (0-1). Default is 0.2.',
+    }),
+  model: z
+    .string()
+    .optional()
+    .openapi({
+      description: 'Optional model override. Default is @cf/facebook/detr-resnet-50.',
+    }),
 })
 
 const PersonDetectUploadSchema = z.object({
-  file: z
-    .any()
-    .openapi({ type: 'string', format: 'binary', description: 'Image file' }),
-  threshold: z.union([z.string(), z.number()]).optional(),
-  model: z.string().optional(),
+  file: z.any().openapi({
+    type: 'string',
+    format: 'binary',
+    description: 'Image file to upload and analyze.',
+  }),
+  threshold: z
+    .union([z.string(), z.number()])
+    .optional()
+    .openapi({ description: 'Confidence threshold for person detection.' }),
+  minAreaRatio: z
+    .union([z.string(), z.number()])
+    .optional()
+    .openapi({
+      description: 'Minimum person box area ratio (0-1). Default is 0.2.',
+    }),
+  model: z
+    .string()
+    .optional()
+    .openapi({
+      description: 'Optional model override. Default is @cf/facebook/detr-resnet-50.',
+    }),
 })
 
 const PersonDetectResponseSchema = z.object({
@@ -66,14 +104,22 @@ export const personDetectRoute = createRoute({
             url_only: {
               summary: 'Default threshold and model',
               value: {
-                url: 'https://example.com/photo.jpg',
+                url: 'https://gallery233.pages.dev/file/CAACAgUAAyEGAASTYPw6AAEErwppelx1gAZ3GYjD_GgMNvp5dcFoCQACiBcAAivo2FdGPB0AAVbLGgw4BA.webp',
               },
             },
             custom_threshold: {
               summary: 'Custom threshold',
               value: {
-                url: 'https://example.com/photo.jpg',
+                url: 'https://gallery233.pages.dev/file/CAACAgUAAyEGAASTYPw6AAEErwppelx1gAZ3GYjD_GgMNvp5dcFoCQACiBcAAivo2FdGPB0AAVbLGgw4BA.webp',
                 threshold: 0.6,
+                minAreaRatio: 0.2,
+              },
+            },
+            area_ratio_only: {
+              summary: 'Minimum person box area ratio',
+              value: {
+                url: 'https://gallery233.pages.dev/file/CAACAgUAAyEGAASTYPw6AAEErwppelx1gAZ3GYjD_GgMNvp5dcFoCQACiBcAAivo2FdGPB0AAVbLGgw4BA.webp',
+                minAreaRatio: 0.2,
               },
             },
           },
@@ -86,6 +132,7 @@ export const personDetectRoute = createRoute({
               value: {
                 file: '<binary>',
                 threshold: '0.7',
+                minAreaRatio: '0.2',
               },
             },
           },
@@ -179,6 +226,7 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
       }
 
       const threshold = parseThreshold(body.threshold)
+      const minAreaRatio = parseRatio(body.minAreaRatio)
       const model = typeof body.model === 'string' ? body.model : undefined
       const buffer = await file.arrayBuffer()
       const imageBytes = await maybeTranscodeAvif(buffer, file.type, traceId)
@@ -190,7 +238,11 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
         traceId,
       })
 
-      const isPerson = hasPerson(result, threshold ?? DEFAULT_THRESHOLD)
+      const isPerson = hasPerson(
+        result,
+        threshold ?? DEFAULT_THRESHOLD,
+        minAreaRatio ?? DEFAULT_MIN_AREA_RATIO
+      )
       return c.json({ success: true, isPerson })
     }
 
@@ -226,7 +278,7 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
         cause: parsed.error,
       })
     }
-    const { url, threshold, model } = parsed.data
+    const { url, threshold, model, minAreaRatio } = parsed.data
     const { buffer, contentType: fetchedContentType } = await fetchImageBuffer(
       url,
       traceId
@@ -244,7 +296,11 @@ export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) =>
       traceId,
     })
 
-    const isPerson = hasPerson(result, threshold ?? DEFAULT_THRESHOLD)
+    const isPerson = hasPerson(
+      result,
+      threshold ?? DEFAULT_THRESHOLD,
+      minAreaRatio ?? DEFAULT_MIN_AREA_RATIO
+    )
     return c.json({ success: true, isPerson })
   } catch (error) {
     if (error instanceof AiRunError) {
@@ -326,6 +382,14 @@ function isJsonContentType(contentType: string) {
   return value.includes('application/json') || value.includes('+json')
 }
 
+function parseRatio(value: unknown) {
+  const parsed = parseThreshold(value)
+  if (typeof parsed === 'number' && parsed >= 0 && parsed <= 1) {
+    return parsed
+  }
+  return undefined
+}
+
 function parseThreshold(value: unknown) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value
@@ -397,17 +461,92 @@ function isAvif(buffer: ArrayBuffer, contentType?: string) {
   return false
 }
 
-function hasPerson(result: unknown, threshold: number) {
+function hasPerson(result: unknown, threshold: number, minAreaRatio: number) {
   if (!Array.isArray(result)) {
     return false
   }
+  console.log('Detection result:', result)
+  debugger
   return result.some((item) => {
     if (!item || typeof item !== 'object') {
       return false
     }
     const record = item as Record<string, unknown>
-    return record.label === 'person' && typeof record.score === 'number'
-      ? record.score >= threshold
-      : false
+    if (record.label !== 'person' || typeof record.score !== 'number') {
+      return false
+    }
+    if (record.score < threshold) {
+      return false
+    }
+
+    const ratio = extractAreaRatio(record)
+    if (ratio === null) {
+      return true
+    }
+    return ratio >= minAreaRatio
   })
+}
+
+function extractAreaRatio(record: Record<string, unknown>) {
+  const box = record.box
+  if (!box || typeof box !== 'object') {
+    return null
+  }
+
+  const asRecord = box as Record<string, unknown>
+  const x1 = numberOrUndefined(
+    asRecord.xmin ?? asRecord.x1 ?? asRecord.left ?? asRecord.x0
+  )
+  const y1 = numberOrUndefined(
+    asRecord.ymin ?? asRecord.y1 ?? asRecord.top ?? asRecord.y0
+  )
+  const x2 = numberOrUndefined(
+    asRecord.xmax ?? asRecord.x2 ?? asRecord.right ?? asRecord.x1
+  )
+  const y2 = numberOrUndefined(
+    asRecord.ymax ?? asRecord.y2 ?? asRecord.bottom ?? asRecord.y1
+  )
+  if (x1 !== undefined && y1 !== undefined && x2 !== undefined && y2 !== undefined) {
+    const width = x2 - x1
+    const height = y2 - y1
+    return normalizedArea(width, height)
+  }
+
+  const width = numberOrUndefined(asRecord.w ?? asRecord.width)
+  const height = numberOrUndefined(asRecord.h ?? asRecord.height)
+  if (width !== undefined && height !== undefined) {
+    return normalizedArea(width, height)
+  }
+
+  if (Array.isArray(box) && box.length >= 4) {
+    const bx1 = numberOrUndefined(box[0])
+    const by1 = numberOrUndefined(box[1])
+    const bx2 = numberOrUndefined(box[2])
+    const by2 = numberOrUndefined(box[3])
+    if (bx1 !== undefined && by1 !== undefined && bx2 !== undefined && by2 !== undefined) {
+      return normalizedArea(bx2 - bx1, by2 - by1)
+    }
+  }
+
+  return null
+}
+
+function normalizedArea(width: number, height: number) {
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    return null
+  }
+  if (width <= 0 || height <= 0) {
+    return null
+  }
+  if (width > 1 || height > 1) {
+    return null
+  }
+  return width * height
+}
+
+function numberOrUndefined(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  return undefined
 }

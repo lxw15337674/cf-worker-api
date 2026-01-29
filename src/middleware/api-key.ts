@@ -13,14 +13,8 @@ export const apiKeyAuth: MiddlewareHandler = async (c: Context, next) => {
   const configuredKey = c.env?.API_KEY
   const providedKey = c.req.header('x-api-key')
 
-  if (!configuredKey) {
-    const err = new AiRunError({
-      code: 'UNAUTHORIZED',
-      message: 'API key is not configured',
-      status: 401,
-      traceId,
-    })
-    return c.json(toErrorBody(err), err.status)
+  if (!configuredKey || configuredKey.trim() === '') {
+    return next()
   }
 
   if (!providedKey) {
