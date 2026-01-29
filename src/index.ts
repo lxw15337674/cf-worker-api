@@ -1,6 +1,7 @@
 import { Scalar } from '@scalar/hono-api-reference'
 import { OpenAPIHono } from '@hono/zod-openapi'
 import { aiRunHandler, aiRunRoute } from './routes/ai'
+import { personDetectHandler, personDetectRoute } from './routes/vision'
 import type { Bindings } from './types/hono-env'
 import { AiRunError, toErrorBody } from './utils/ai-errors'
 import { getTraceId } from './utils/trace'
@@ -55,5 +56,6 @@ app.get('/docs',
 app.doc('/openapi.json', openApiConfig)
 
 app.openapi(aiRunRoute, aiRunHandler)
+app.openapi(personDetectRoute, personDetectHandler)
 
 export default app

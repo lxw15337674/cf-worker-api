@@ -36,6 +36,7 @@ export async function runAiModel({
       effectiveTimeoutMs
     )
 
+    
     const durationMs = Date.now() - startedAt
     logAiSuccess({
       model,
