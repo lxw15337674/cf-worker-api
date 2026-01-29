@@ -16,6 +16,8 @@ const AiErrorResponseSchema = z.object({
   error: z.object({
     code: z.enum([
       'INVALID_INPUT',
+      'UNAUTHORIZED',
+      'FORBIDDEN',
       'AI_RUN_TIMEOUT',
       'AI_RUN_EXCEPTION',
       'AI_RUN_RESPONSE_ERROR',

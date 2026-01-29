@@ -1,4 +1,4 @@
-import { createRoute, z } from '@hono/zod-openapi'
+import { createRoute, extendZodWithOpenApi, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import type { Bindings } from '../types/hono-env'
 import { AiRunError, toErrorBody } from '../utils/ai-errors'
@@ -9,12 +9,22 @@ import { encode as encodePng } from '@jsquash/png'
 
 const DEFAULT_DETR_MODEL = '@cf/facebook/detr-resnet-50'
 const DEFAULT_THRESHOLD = 0.7
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 15_000
+
+extendZodWithOpenApi(z)
 
 const PersonDetectRequestSchema = z.object({
   url: z.string().url(),
   threshold: z.number().min(0).max(1).optional(),
+  model: z.string().optional(),
+})
+
+const PersonDetectUploadSchema = z.object({
+  file: z
+    .any()
+    .openapi({ type: 'string', format: 'binary', description: 'Image file' }),
+  threshold: z.union([z.string(), z.number()]).optional(),
   model: z.string().optional(),
 })
 
@@ -28,6 +38,8 @@ const AiErrorResponseSchema = z.object({
   error: z.object({
     code: z.enum([
       'INVALID_INPUT',
+      'UNAUTHORIZED',
+      'FORBIDDEN',
       'AI_RUN_TIMEOUT',
       'AI_RUN_EXCEPTION',
       'AI_RUN_RESPONSE_ERROR',
@@ -62,6 +74,18 @@ export const personDetectRoute = createRoute({
               value: {
                 url: 'https://example.com/photo.jpg',
                 threshold: 0.6,
+              },
+            },
+          },
+        },
+        'multipart/form-data': {
+          schema: PersonDetectUploadSchema,
+          examples: {
+            upload: {
+              summary: 'Upload image file',
+              value: {
+                file: '<binary>',
+                threshold: '0.7',
               },
             },
           },
@@ -131,11 +155,78 @@ export const personDetectRoute = createRoute({
 
 export const personDetectHandler = async (c: Context<{ Bindings: Bindings }>) => {
   const traceId = getTraceId(c)
-  const { url, threshold, model } = c.req.valid('json') as z.infer<
-    typeof PersonDetectRequestSchema
-  >
+  const contentType = c.req.header('content-type') ?? ''
 
   try {
+    if (contentType.includes('multipart/form-data')) {
+      const body = (await c.req.parseBody()) as Record<string, unknown>
+      const file = body.file
+      if (!(file instanceof File)) {
+        throw new AiRunError({
+          code: 'INVALID_INPUT',
+          message: 'file is required',
+          status: 400,
+          traceId,
+        })
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        throw new AiRunError({
+          code: 'INVALID_INPUT',
+          message: 'Image is too large',
+          status: 400,
+          traceId,
+        })
+      }
+
+      const threshold = parseThreshold(body.threshold)
+      const model = typeof body.model === 'string' ? body.model : undefined
+      const buffer = await file.arrayBuffer()
+      const imageBytes = await maybeTranscodeAvif(buffer, file.type, traceId)
+      const inputs = { image: [...imageBytes] }
+      const result = await runAiModel({
+        ai: c.env.AI,
+        model: model ?? DEFAULT_DETR_MODEL,
+        input: inputs,
+        traceId,
+      })
+
+      const isPerson = hasPerson(result, threshold ?? DEFAULT_THRESHOLD)
+      return c.json({ success: true, isPerson })
+    }
+
+    if (contentType && !isJsonContentType(contentType)) {
+      throw new AiRunError({
+        code: 'INVALID_INPUT',
+        message: 'Unsupported content-type',
+        status: 400,
+        traceId,
+      })
+    }
+
+    let jsonBody: unknown
+    try {
+      jsonBody = await c.req.json()
+    } catch (error) {
+      throw new AiRunError({
+        code: 'INVALID_INPUT',
+        message: 'Request body must be valid JSON',
+        status: 400,
+        traceId,
+        cause: error,
+      })
+    }
+
+    const parsed = PersonDetectRequestSchema.safeParse(jsonBody)
+    if (!parsed.success) {
+      throw new AiRunError({
+        code: 'INVALID_INPUT',
+        message: 'Request body must be valid JSON',
+        status: 400,
+        traceId,
+        cause: parsed.error,
+      })
+    }
+    const { url, threshold, model } = parsed.data
     const { buffer, contentType } = await fetchImageBuffer(url, traceId)
     const imageBytes = await maybeTranscodeAvif(buffer, contentType, traceId)
     const inputs = { image: [...imageBytes] }
@@ -221,6 +312,24 @@ async function fetchImageBuffer(url: string, traceId: string) {
   } finally {
     clearTimeout(timeoutId)
   }
+}
+
+function isJsonContentType(contentType: string) {
+  const value = contentType.toLowerCase()
+  return value.includes('application/json') || value.includes('+json')
+}
+
+function parseThreshold(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return undefined
 }
 
 async function maybeTranscodeAvif(
