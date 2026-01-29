@@ -17,5 +17,5 @@
   "env": {
     "dev": {
     }
-  }
+  },"name": "cf-worker-api"
 }
